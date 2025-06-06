@@ -7,10 +7,9 @@ from multiprocessing import Pool, cpu_count
 import csv
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from physics import (
-    calculate_power_balance,
+    calculate_power_balance, get_required_heating_power,
     simulate_particle_for_vis, calculate_simple_q_value,
     plot_trajectories_for_vis, plot_energy_vs_time_for_vis,
     animate_trajectories, e_charge, m_D
@@ -24,16 +23,11 @@ def run_particle_sim_worker(args):
     vis_params, coil_points = args
     return simulate_particle_for_vis(vis_params, coil_points)
 
-# Helper function for running sensitivity scans in parallel
-def run_scan_worker(params):
-    """Helper function to run a single power balance calculation for the pool."""
-    return calculate_power_balance(params)
-
 class FusionSimulatorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Fusion Simulation Suite")
-        self.root.geometry("800x850")
+        self.root.geometry("700x800")
 
         # --- Data & Parameters ---
         self.output_dir = "sim_output_" + time.strftime("%Y%m%d_%H%M%S")
@@ -45,13 +39,10 @@ class FusionSimulatorApp:
         self.notebook.pack(pady=10, padx=10, fill="both", expand=True)
         self.tab1 = ttk.Frame(self.notebook)
         self.tab2 = ttk.Frame(self.notebook)
-        self.tab3 = ttk.Frame(self.notebook)
         self.notebook.add(self.tab1, text='Reactor Feasibility Analysis')
-        self.notebook.add(self.tab2, text='Sensitivity Scan')
-        self.notebook.add(self.tab3, text='Particle Visualizer')
+        self.notebook.add(self.tab2, text='Particle Visualizer')
 
         self.create_feasibility_tab()
-        self.create_sensitivity_tab()
         self.create_visualizer_tab()
 
         # --- Add clean exit handler ---
@@ -67,25 +58,34 @@ class FusionSimulatorApp:
         """Defines the preset parameters for different reactor concepts."""
         self.presets = {
             "Custom": {},
+            # --- MODIFICATION START ---
+            # Added a new preset for the revised Fibonacci Reactor concept based on the whitepaper.
             "Fibonacci Reactor (Revised Whitepaper)": {
-                'ion_density_m3': 4e20,
-                'ion_temperature_keV': 25.0,
-                'magnetic_field_T': 8.0,
-                'plasma_volume_m3': 2.0,
-                'plasma_surface_area_m2': 15.0, # New: Estimated surface area
-                'transport_geometry_factor_G': 50.0, # New: Represents confinement improvement vs gyro-Bohm
-                'density_profile_alpha': 1.5,   # New: Peaked density profile
-                'temp_profile_alpha': 1.5,      # New: Peaked temperature profile
-                'Z_eff': 1.6
+                'ion_density_m3': 4e20,             # Source: Whitepaper 
+                'ion_temperature_keV': 25.0,        # Source: Whitepaper 
+                'confinement_time_s': 1.0,          # Source: Whitepaper 
+                'magnetic_field_T': 8.0,            # Assumption: Plausible value for a high-field compact reactor. Not specified in whitepaper's 0D model.
+                'plasma_volume_m3': 2.0,            # Assumption: Plausible estimate for a compact reactor with a 1.2m major diameter as per whitepaper. This corrects the 840 m³ discrepancy.
+                'Z_eff': 1.6                        # Assumption: Plausible value for a D-D plasma with some impurities/ash.
             },
+            # --- MODIFICATION END ---
             "ITER (Projected)": {
-                'ion_density_m3': 1e20, 'ion_temperature_keV': 20.0, 'magnetic_field_T': 5.3,
-                'plasma_volume_m3': 840.0, 'plasma_surface_area_m2': 1200.0,
-                'transport_geometry_factor_G': 2.5, # Corresponds to typical H-mode factors
-                'density_profile_alpha': 0.5, 'temp_profile_alpha': 1.0, 'Z_eff': 1.8
+                'ion_density_m3': 1e20, 'ion_temperature_keV': 20.0, 'confinement_time_s': 3.7,
+                'magnetic_field_T': 5.3, 'plasma_volume_m3': 840.0, 'Z_eff': 1.8
             },
+            "SPARC (Projected)": {
+                'ion_density_m3': 4e20, 'ion_temperature_keV': 25.0, 'confinement_time_s': 1.0,
+                'magnetic_field_T': 12.2, 'plasma_volume_m3': 10.0, 'Z_eff': 1.5
+            },
+            "Fibonacci (Old/Retracted Claim)": { # Renamed for clarity
+                'ion_density_m3': 1e20, 'ion_temperature_keV': 0.01, 'confinement_time_s': 5.0,
+                'magnetic_field_T': 1.0, 'plasma_volume_m3': 2.2, 'Z_eff': 1.0
+            }
         }
+        # --- MODIFICATION START ---
+        # Set the default preset to the new Fibonacci Reactor model
         self.phys_params = self.presets["Fibonacci Reactor (Revised Whitepaper)"].copy()
+        # --- MODIFICATION END ---
 
 
     def create_feasibility_tab(self):
@@ -95,7 +95,10 @@ class FusionSimulatorApp:
         preset_frame = ttk.Frame(main_frame)
         preset_frame.pack(fill=tk.X, expand=True, pady=5)
         ttk.Label(preset_frame, text="Load Preset:").pack(side=tk.LEFT)
+        # --- MODIFICATION START ---
+        # Update the default value in the dropdown menu
         self.preset_var = tk.StringVar(value="Fibonacci Reactor (Revised Whitepaper)")
+        # --- MODIFICATION END ---
         preset_menu = ttk.Combobox(preset_frame, textvariable=self.preset_var, values=list(self.presets.keys()))
         preset_menu.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         preset_menu.bind("<<ComboboxSelected>>", self.load_preset)
@@ -104,15 +107,9 @@ class FusionSimulatorApp:
         input_frame.pack(fill=tk.X, expand=True)
         self.phys_entries = {}
         param_labels = {
-            'ion_density_m3': "Ion Density (n) [m⁻³]:",
-            'ion_temperature_keV': "Ion Temperature (T) [keV]:",
-            'magnetic_field_T': "Magnetic Field (B) [T]:",
-            'plasma_volume_m3': "Plasma Volume (V) [m³]:",
-            'plasma_surface_area_m2': "Plasma Surface Area (A) [m²]:",
-            'transport_geometry_factor_G': "Transport Geometry Factor (G):",
-            'density_profile_alpha': "Density Profile Peaking (α_n):",
-            'temp_profile_alpha': "Temp. Profile Peaking (α_T):",
-            'Z_eff': "Effective Charge (Z_eff):"
+            'ion_density_m3': "Ion Density (n) [m⁻³]:", 'ion_temperature_keV': "Ion Temperature (T) [keV]:",
+            'confinement_time_s': "Energy Confinement Time (τE) [s]:", 'magnetic_field_T': "Magnetic Field (B) [T]:",
+            'plasma_volume_m3': "Plasma Volume (V) [m³]:", 'Z_eff': "Effective Charge (Z_eff):"
         }
         for i, (key, label) in enumerate(param_labels.items()):
             ttk.Label(input_frame, text=label).grid(row=i, column=0, sticky=tk.W, pady=2)
@@ -122,16 +119,13 @@ class FusionSimulatorApp:
         input_frame.columnconfigure(1, weight=1)
 
         ttk.Button(main_frame, text="Calculate Power Balance", command=self.run_physics_simulation).pack(fill=tk.X, pady=10)
-        results_frame = ttk.LabelFrame(main_frame, text="Performance & Stability Results", padding="10")
+        results_frame = ttk.LabelFrame(main_frame, text="Power Balance & Q-Value Results", padding="10")
         results_frame.pack(fill=tk.X, expand=True, pady=5)
         self.phys_result_labels = {}
         result_keys = [
             ("P_fusion_MW", "Fusion Power [MW]:"), ("P_rad_MW", "Radiation Loss [MW]:"),
             ("P_transport_MW", "Transport Loss [MW]:"), ("P_heating_MW", "Required Heating Power [MW]:"),
-            ("Q_value", "Q-Value (P_fusion / P_heating):"), ("Triple_Product_1e20", "Lawson Criterion (nτT) [10²⁰]:"),
-            ("confinement_time_s", "Calculated Energy Confinement (τE) [s]:"),
-            ("plasma_beta_percent", "Plasma Beta (β) [%]:"),
-            ("wall_load_MW_m2", "Avg. Wall Load [MW/m²]:"),
+            ("Q_value", "Q-Value (P_fusion / P_heating):"), ("Triple_Product", "Lawson Criterion (nτT):")
         ]
         for i, (key, label) in enumerate(result_keys):
             ttk.Label(results_frame, text=label).grid(row=i, column=0, sticky=tk.W)
@@ -146,61 +140,14 @@ class FusionSimulatorApp:
         export_menu.add_command(label="Export as CSV", command=lambda: self.export_phys_report('csv'))
         self.phys_export_button["menu"] = export_menu
         self.phys_export_button.pack(fill=tk.X, pady=10)
-
+        
         self.load_preset()
 
-    def create_sensitivity_tab(self):
-        frame = ttk.Frame(self.tab2, padding="10")
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        # --- Setup Frame ---
-        setup_frame = ttk.LabelFrame(frame, text="Scan Setup", padding="10")
-        setup_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(setup_frame, text="Parameter to Scan:").grid(row=0, column=0, sticky=tk.W, padx=5)
-        self.scan_param_var = tk.StringVar()
-        param_keys = [
-            'ion_density_m3', 'ion_temperature_keV', 'magnetic_field_T', 
-            'transport_geometry_factor_G', 'Z_eff', 'density_profile_alpha', 'temp_profile_alpha'
-        ]
-        self.scan_param_menu = ttk.Combobox(setup_frame, textvariable=self.scan_param_var, values=param_keys, state="readonly")
-        self.scan_param_menu.grid(row=0, column=1, columnspan=3, sticky=tk.EW, padx=5)
-        self.scan_param_menu.set('ion_temperature_keV')
-
-        ttk.Label(setup_frame, text="Range Start (%):").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
-        self.scan_start_entry = ttk.Entry(setup_frame, width=10)
-        self.scan_start_entry.grid(row=1, column=1, padx=5)
-        self.scan_start_entry.insert(0, "80")
-        
-        ttk.Label(setup_frame, text="Range End (%):").grid(row=1, column=2, sticky=tk.W, padx=5)
-        self.scan_end_entry = ttk.Entry(setup_frame, width=10)
-        self.scan_end_entry.grid(row=1, column=3, padx=5)
-        self.scan_end_entry.insert(0, "120")
-
-        ttk.Label(setup_frame, text="Number of Steps:").grid(row=2, column=0, sticky=tk.W, padx=5)
-        self.scan_steps_entry = ttk.Entry(setup_frame, width=10)
-        self.scan_steps_entry.grid(row=2, column=1, padx=5)
-        self.scan_steps_entry.insert(0, "21")
-
-        ttk.Button(setup_frame, text="Run Sensitivity Scan", command=self.run_sensitivity_scan).grid(row=3, column=0, columnspan=4, sticky=tk.EW, pady=10, padx=5)
-
-        # --- Plot Frame ---
-        plot_frame = ttk.LabelFrame(frame, text="Scan Results", padding="10")
-        plot_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        self.scan_fig = plt.figure(figsize=(6, 4))
-        self.scan_ax = self.scan_fig.add_subplot(111)
-        self.scan_canvas = FigureCanvasTkAgg(self.scan_fig, master=plot_frame)
-        self.scan_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        self.scan_ax.set_title("Run a scan to see results")
-        self.scan_ax.grid(True)
-        self.scan_fig.tight_layout()
-
     def create_visualizer_tab(self):
-        # This tab's functionality remains largely unchanged
         self.vis_params = {'num_particles': 10, 'num_coils': 7, 'coil_radius': 0.2, 'coil_pitch': 1.0, 'B_strength': 5.0, 'sim_time': 1e-05, 'max_velocity': 1e6}
         self.vis_trajectories = []
         
-        frame = ttk.Frame(self.tab3, padding="10")
+        frame = ttk.Frame(self.tab2, padding="10")
         frame.pack(fill=tk.BOTH, expand=True)
 
         params_frame = ttk.LabelFrame(frame, text="Visualizer Parameters", padding="10")
@@ -234,92 +181,33 @@ class FusionSimulatorApp:
         self.time_label.pack(pady=2)
         self.vis_status_label = ttk.Label(frame, text="Ready.")
         self.vis_status_label.pack(pady=5)
-        
+
     def load_preset(self, event=None):
         preset_name = self.preset_var.get()
         if preset_name == "Custom": return
         self.phys_params = self.presets[preset_name].copy()
         for key, entry in self.phys_entries.items():
             entry.delete(0, tk.END)
-            # Use scientific notation only for density
-            if 'density' in key:
-                entry.insert(0, f"{self.phys_params[key]:.1e}")
-            else:
-                entry.insert(0, str(self.phys_params[key]))
-
-    def get_current_phys_params(self):
-        """Reads all values from the feasibility tab entries and returns a dict."""
-        current_params = {}
-        for key, entry in self.phys_entries.items():
-            current_params[key] = float(entry.get())
-        return current_params
-
-    def run_physics_simulation(self):
-        try:
-            self.phys_params = self.get_current_phys_params()
-        except ValueError:
-            messagebox.showerror("Invalid Input", "Please ensure all parameters are valid numbers.")
-            return
-        
-        self.preset_var.set("Custom")
-        self.phys_results = calculate_power_balance(self.phys_params)
-
-        for key, label in self.phys_result_labels.items():
-            if key in self.phys_results:
-                label.config(text=f"{self.phys_results[key]:.4e}")
-        
-        self.phys_export_button.config(state=tk.NORMAL)
-
-    def run_sensitivity_scan(self):
-        try:
-            base_params = self.get_current_phys_params()
-            scan_param_key = self.scan_param_var.get()
-            start_percent = float(self.scan_start_entry.get())
-            end_percent = float(self.scan_end_entry.get())
-            steps = int(self.scan_steps_entry.get())
-        except (ValueError, KeyError) as e:
-            messagebox.showerror("Invalid Scan Input", f"Please ensure all scan parameters are valid.\nError: {e}")
-            return
-        
-        base_value = base_params[scan_param_key]
-        scan_values = np.linspace(base_value * start_percent / 100, base_value * end_percent / 100, steps)
-        
-        # Create a list of tasks for the multiprocessing pool
-        tasks = []
-        for val in scan_values:
-            task_params = base_params.copy()
-            task_params[scan_param_key] = val
-            tasks.append(task_params)
-
-        # Run the simulations in parallel
-        with Pool(processes=max(1, cpu_count() - 1)) as pool:
-            results_list = pool.map(run_scan_worker, tasks)
-        
-        q_values = [res['Q_value'] for res in results_list]
-
-        # Plot the results
-        self.scan_ax.clear()
-        self.scan_ax.plot(scan_values, q_values, 'bo-')
-        self.scan_ax.set_title(f"Sensitivity of Q-Value to {scan_param_key}")
-        self.scan_ax.set_xlabel(scan_param_key.replace('_', ' ').title())
-        self.scan_ax.set_ylabel("Q-Value")
-        self.scan_ax.grid(True)
-        self.scan_fig.tight_layout()
-        self.scan_canvas.draw()
-        
-        messagebox.showinfo("Scan Complete", "Sensitivity scan finished successfully.")
+            entry.insert(0, f"{self.phys_params[key]:.1e}" if 'density' in key else str(self.phys_params[key]))
 
     def import_from_feasibility(self):
+        """Copies relevant parameters from the Feasibility tab to the Visualizer tab."""
         try:
-            current_params = self.get_current_phys_params()
-            b_field = current_params.get('magnetic_field_T', 5.0)
+            # Update params dict from Feasibility entry fields first
+            for key, entry in self.phys_entries.items():
+                self.phys_params[key] = float(entry.get())
+            
+            # 1. Copy Magnetic Field
+            b_field = self.phys_params.get('magnetic_field_T', 5.0)
             self.vis_entries['B_strength'].delete(0, tk.END)
             self.vis_entries['B_strength'].insert(0, str(b_field))
 
-            temp_keV = current_params.get('ion_temperature_keV', 15.0)
+            # 2. Calculate and copy Max Velocity from Temperature
+            temp_keV = self.phys_params.get('ion_temperature_keV', 15.0)
             temp_joules = temp_keV * 1000 * e_charge
+            # v_rms = sqrt(3*k*T/m), so use a multiple of this for max velocity
             v_rms = np.sqrt(3 * temp_joules / m_D)
-            max_velocity = 2 * v_rms
+            max_velocity = 2 * v_rms # Set max velocity to twice the RMS speed
             self.vis_entries['max_velocity'].delete(0, tk.END)
             self.vis_entries['max_velocity'].insert(0, f"{max_velocity:.2e}")
             
@@ -328,23 +216,27 @@ class FusionSimulatorApp:
         except (ValueError, KeyError) as e:
             messagebox.showerror("Import Failed", f"Could not import parameters. Please ensure Feasibility values are valid numbers.\nError: {e}")
 
+
+    def run_physics_simulation(self):
+        try:
+            for key, entry in self.phys_entries.items(): self.phys_params[key] = float(entry.get())
+        except ValueError: messagebox.showerror("Invalid Input", "Please ensure all parameters are valid numbers."); return
+        self.preset_var.set("Custom")
+        self.phys_params['P_heating_MW'] = get_required_heating_power(self.phys_params)
+        self.phys_results = calculate_power_balance(self.phys_params)
+        for key, label in self.phys_result_labels.items():
+            if key in self.phys_results: label.config(text=f"{self.phys_results[key]:.4e}")
+        self.phys_export_button.config(state=tk.NORMAL)
+
     def export_phys_report(self, format_type):
         filename = filedialog.asksaveasfilename(initialdir=self.output_dir, title=f"Save {format_type.upper()} Report", defaultextension=f".{format_type}")
         if not filename: return
         try:
-            # Get latest params from entries before exporting
-            current_params = self.get_current_phys_params()
-            
-            if format_type == 'pdf': generate_pdf_report(filename, current_params, self.phys_results)
-            elif format_type == 'html': generate_html_report(filename, current_params, self.phys_results)
+            if format_type == 'pdf': generate_pdf_report(filename, self.phys_params, self.phys_results)
+            elif format_type == 'html': generate_html_report(filename, self.phys_params, self.phys_results)
             elif format_type == 'csv':
                 with open(filename, 'w', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(['Parameter', 'Value'])
-                    writer.writerows(current_params.items())
-                    writer.writerow([])
-                    writer.writerow(['Result', 'Value'])
-                    writer.writerows(self.phys_results.items())
+                    writer = csv.writer(f); writer.writerow(['Parameter', 'Value']); writer.writerows(self.phys_params.items()); writer.writerow([]); writer.writerow(['Result', 'Value']); writer.writerows(self.phys_results.items())
             messagebox.showinfo("Export Successful", f"Report saved to:\n{filename}")
         except Exception as e: messagebox.showerror("Export Failed", f"An error occurred: {e}")
 
@@ -402,7 +294,6 @@ class FusionSimulatorApp:
         animate_trajectories(self.vis_trajectories, gif_path, animation_window)
         messagebox.showinfo("Animation Saved", f"Animation saved to:\n{gif_path}")
         self.vis_status_label.config(text=f"Simulation complete.")
-
 
 if __name__ == '__main__':
     root = tk.Tk()

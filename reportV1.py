@@ -18,7 +18,7 @@ def generate_pdf_report(filename, params, results):
         pdf.cell(95, 8, f"{value:.3e}", border=1, ln=True)
     pdf.ln(5)
     pdf.set_font("Arial", 'B', 12)
-    pdf.cell(0, 10, "Performance & Stability Results", ln=True)
+    pdf.cell(0, 10, "Simulation Results", ln=True)
     pdf.set_font("Arial", '', 10)
     for key, value in results.items():
         pdf.cell(95, 8, f"{key.replace('_', ' ').title()}:", border=1)
@@ -37,7 +37,7 @@ def generate_html_report(filename, params, results):
     <h2>Input Parameters</h2><table><tr><th>Parameter</th><th>Value</th></tr>
     """
     for key, value in params.items(): html += f"<tr><td>{key.replace('_', ' ').title()}</td><td>{value:.3e}</td></tr>"
-    html += "</table><h2>Performance & Stability Results</h2><table><tr><th>Result</th><th>Value</th></tr>"
+    html += "</table><h2>Simulation Results</h2><table><tr><th>Result</th><th>Value</th></tr>"
     for key, value in results.items(): html += f"<tr><td>{key.replace('_', ' ').title()}</td><td>{value:.4e}</td></tr>"
     html += "</table></body></html>"
     with open(filename, 'w') as f: f.write(html)
