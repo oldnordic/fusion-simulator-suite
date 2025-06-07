@@ -1,230 +1,200 @@
 # physics.py
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.integrate import solve_ivp
-from mpl_toolkits.mplot3d import Axes3D
-from matplotlib import animation
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import tkinter as tk
 
 # --- Constants ---
-e_charge = 1.602e-19  # Electron charge in C
-m_p = 1.672e-27       # Proton mass in kg
-m_D = 3.344e-27       # Deuteron mass in kg
-mu_0 = 4 * np.pi * 1e-7 # Vacuum permeability
-k_boltzmann = 1.3806e-23 # Boltzmann constant
+e_charge = 1.602e-19
+m_D = 3.344e-27  # Deuterium mass
+m_T = 5.008e-27  # Tritium mass
+m_p = 1.672e-27  # Proton mass for scaling
+mu_0 = 4 * np.pi * 1e-7
+k_boltzmann = 1.3806e-23
+epsilon_0 = 8.854e-12
 
-# ==============================================================================
-# SECTION 1: 0D REACTOR PHYSICS MODELS
-# ==============================================================================
-def fusion_reactivity_dd(temp_keV):
+def get_radial_grid(params):
     """
-    Calculates the D-D fusion reactivity <σv> using the Bosch-Hale formulation.
-    Input: temp_keV (float) - Ion temperature in keV
-    Output: <σv> in m³/s
+    Derives minor radius 'a' and a radial grid.
+    This uses an approximation for a toroidal plasma.
     """
-    if temp_keV <= 0: return 0.0
-    B_G = 31.397
-    # Coefficients for the analytical fit
-    c = [1.5136e-2, 2.5247e-3, 3.0313e-3, -1.1793e-4, 8.7183e-6, -2.4839e-7, 2.7051e-9]
-    theta = temp_keV / (1 - (temp_keV * (c[2] + temp_keV * (c[4] + temp_keV * c[6]))) / (1 + temp_keV * (c[1] + temp_keV * (c[3] + temp_keV * c[5]))))
-    zeta = (B_G**2 / (4 * theta))**(1/3)
-    # The reactivity formula
-    return 5.68e-18 * (zeta**2 * np.exp(-3 * zeta)) / (temp_keV**(2/3))
-
-def calculate_bremsstrahlung_loss(n_e_m3, T_e_keV, Z_eff):
-    """
-    Calculates Bremsstrahlung radiation power density.
-    Output: Power density in MW/m³
-    """
-    T_e_eV = T_e_keV * 1000
-    # Standard formula for Bremsstrahlung power density in W/m³
-    power_density_W_m3 = 5.35e-37 * (n_e_m3**2) * Z_eff * np.sqrt(T_e_eV)
-    return power_density_W_m3 / 1e6  # Convert to MW/m³
-
-def calculate_gyro_bohm_transport_loss(params):
-    """
-    Estimates transport loss based on gyro-Bohm scaling. This is a physics-based
-    model for turbulent transport, replacing the simple tau_E assumption.
-    The Geometry Factor G represents the confinement improvement of the specific
-    magnetic geometry over a simple tokamak.
-    """
-    n_i = params['ion_density_m3']
-    T_i_keV = params['ion_temperature_keV']
-    B = params['magnetic_field_T']
-    V = params['plasma_volume_m3']
-    G = params['transport_geometry_factor_G']
+    vol = params.get('plasma_volume_m3', 0)
+    area = params.get('plasma_surface_area_m2', 0)
     
-    # Estimate minor radius 'a' from volume, assuming toroidal aspect ratio of 3 (R=3a)
-    # V = 2 * pi^2 * R * a^2 = 2 * pi^2 * (3a) * a^2 = 6 * pi^2 * a^3
-    a = (V / (6 * np.pi**2))**(1/3)
-    if a == 0: return float('inf')
+    if vol <= 0 or area <= 0:
+        return np.array([0]), 0
 
-    # Gyro-Bohm diffusion coefficient scaling: D_gB ~ (rho_s / a) * (c_s * rho_s)
-    # This leads to P_loss ~ n * T^2.5 / (B^2 * a^2)
-    # A simplified but physically motivated scaling for power loss density
-    # The coefficient is empirical and tuned to give reasonable tau_E for known machines
-    p_transport_density_MW_m3 = 8e-7 * (n_i/1e20)**1.0 * (T_i_keV)**2.5 / (B**2 * a**2)
+    # Estimate major radius R and minor radius a from volume and surface area
+    # V = 2 * pi^2 * R * a^2
+    # A = 4 * pi^2 * R * a
+    # From these, R = A^2 / (8 * pi^2 * V) and a = 2V / A
+    R_major_est = area**2 / (8 * np.pi**2 * vol)
+    a = (2 * vol) / area
+    
+    return np.linspace(0, a, 101), a
 
-    # The Geometry Factor G improves confinement, reducing transport loss
-    if G <= 0: return float('inf')
-    return (p_transport_density_MW_m3 / G) * V
+def create_radial_profile(r, r_max, central_value, alpha):
+    """Creates a parabolic-like radial profile."""
+    if r_max <= 0: return np.zeros_like(r)
+    # Ensure the profile doesn't become complex for r > r_max
+    norm_r_sq = (r / r_max)**2
+    return central_value * (1 - np.minimum(norm_r_sq, 1.0))**alpha
 
-def calculate_plasma_beta(params):
+def fusion_reactivity(T_keV, fuel_cycle='D-T'):
     """
-    Calculates plasma beta (β), the ratio of plasma pressure to magnetic pressure.
-    A key indicator for MHD stability.
+    Calculates fusion reactivity <sigma*v> in m^3/s using Bosch-Hale fits.
     """
-    n_i = params['ion_density_m3']
-    T_i_keV = params['ion_temperature_keV']
-    B = params['magnetic_field_T']
+    T_keV = np.maximum(T_keV, 1e-3) # Avoid issues at T=0
+    if fuel_cycle == 'D-T':
+        # D-T reactivity fit coefficients
+        B_G, c = 34.3827, [1.17302e-1, 1.51361e-2, 2.56434e-1, -1.43699e-3, 1.30938e-5, 0, 4.88168e-7]
+        theta = T_keV / (1 - (T_keV * (c[2] + T_keV * (c[4] + T_keV * c[6]))) / (1 + T_keV * (c[1] + T_keV * (c[3] + T_keV * c[5]))))
+        theta = np.maximum(theta, 1e-6)
+        zeta = (B_G**2 / (4 * theta))**(1/3)
+        # Convert from cm^3/s to m^3/s
+        return (1.1e-12 * (theta**(-2/3)) * np.exp(-3 * zeta)) / 1e6 
+    else: # D-D average reactivity fit
+        B_G, c = 31.397, [1.5136e-2, 2.5247e-3, 3.0313e-3, -1.1793e-4, 8.7183e-6, -2.4839e-7, 2.7051e-9]
+        theta = T_keV / (1 - (T_keV * (c[2] + T_keV * (c[4] + T_keV * c[6]))) / (1 + T_keV * (c[1] + T_keV * (c[3] + T_keV * c[5]))))
+        theta = np.maximum(theta, 1e-6)
+        zeta = (B_G**2 / (4 * theta))**(1/3)
+        # Convert from cm^3/s to m^3/s
+        return (5.68e-18 * (zeta**2 * np.exp(-3 * zeta)) / (T_keV**(2/3))) / 1e6
 
-    # Assuming T_e ~ T_i for this 0D model
-    T_joules = T_i_keV * 1000 * e_charge
-    # Total plasma pressure (ions + electrons)
-    plasma_pressure = 2 * n_i * k_boltzmann * (T_joules / e_charge / 1000)
-    magnetic_pressure = B**2 / (2 * mu_0)
+def calculate_pmi_effects(params, n_profile, tau_E):
+    """Estimates the increase in Z_eff due to plasma-material interaction (sputtering)."""
+    sputtering_yield = params.get('sputtering_yield', 0.0)
+    base_Z_eff = params.get('Z_eff', 1.0)
+    if tau_E <= 0 or sputtering_yield == 0: return base_Z_eff
     
-    if magnetic_pressure == 0: return float('inf')
+    total_ions = np.mean(n_profile) * params['plasma_volume_m3']
+    particle_flux_rate = total_ions / tau_E
+    impurity_influx_rate = particle_flux_rate * sputtering_yield
     
-    beta = plasma_pressure / magnetic_pressure
-    return beta * 100 # Return as a percentage
-
-def calculate_power_balance(params):
-    """
-    Main function to calculate the full power balance, stability, and performance metrics.
-    """
-    n_i = params['ion_density_m3']
-    T_i_keV = params['ion_temperature_keV']
-    V = params['plasma_volume_m3']
-    A = params['plasma_surface_area_m2']
-    Z_eff = params['Z_eff']
-    alpha_n = params['density_profile_alpha']
-    alpha_T = params['temp_profile_alpha']
-
-    # --- Profile Effects ---
-    # Approximates the effect of peaked profiles on fusion rate
-    # For profiles like n(r)=n0*(1-r^2/a^2)^alpha, the fusion power is enhanced
-    # This is a common approximation for 0D models.
-    profile_factor = (1 + alpha_n + alpha_T) * (1 + alpha_n)**2 / (1 + 2*alpha_n + alpha_T)
+    # Assuming Tungsten (W) as the impurity from the divertor/wall
+    Z_impurity = 74 
+    # This factor is a simplified empirical term for impurity concentration in the core
+    impurity_confinement_factor_C = 1e-21 
+    delta_Z_eff = impurity_confinement_factor_C * impurity_influx_rate * (Z_impurity**2 - Z_impurity)
     
-    # --- Power Generation ---
-    reactivity = fusion_reactivity_dd(T_i_keV)
-    E_dd_avg_joules = 3.6e6 * e_charge  # Average energy per D-D reaction (MeV to Joules)
-    P_fusion_MW = (0.5 * (n_i**2) * reactivity * E_dd_avg_joules * V * profile_factor) / 1e6
+    return base_Z_eff + delta_Z_eff
+
+def calculate_transport_loss(params, n_profile, T_profile_keV, r_grid, a, R_major):
+    """Calculates power loss due to heat transport based on selected model."""
+    T_profile_J = T_profile_keV * 1000 * e_charge
+    m_ion = (m_D + m_T) / 2 if params['fuel_cycle'] == 'D-T' else m_D
+    B_T = params['magnetic_field_T']
     
-    # --- Power Losses ---
-    P_rad_MW = calculate_bremsstrahlung_loss(n_i, T_i_keV, Z_eff) * V
-    P_transport_MW = calculate_gyro_bohm_transport_loss(params)
-
-    # --- Derived Performance Metrics ---
-    P_loss_total_MW = P_rad_MW + P_transport_MW
-    # Required heating power is the total loss (assuming no alpha heating for this definition)
-    P_heating_MW = P_loss_total_MW
-    Q_value = P_fusion_MW / P_heating_MW if P_heating_MW > 1e-9 else float('inf')
-
-    # Thermal energy content of the plasma
-    W_th_joules = 1.5 * (2 * n_i) * (T_i_keV * 1000 * e_charge) * V
-    confinement_time_s = W_th_joules / (P_loss_total_MW * 1e6) if P_loss_total_MW > 1e-9 else float('inf')
+    # Prevent division by zero if profiles are zero
+    mean_T_J = np.mean(T_profile_J)
+    if mean_T_J <= 0: return 0.0
     
-    triple_product = n_i * confinement_time_s * T_i_keV
-    triple_product_1e20 = triple_product / 1e20 # For easier display
+    if params.get('transport_model') == 'Neo-classical':
+        coll_log = 24 - np.log(np.sqrt(np.mean(n_profile))/(np.mean(T_profile_keV)*1000))
+        nu_ii = (np.mean(n_profile) * (e_charge**4) * coll_log) / (4*np.pi*(epsilon_0**2) * np.sqrt(m_ion) * (mean_T_J**1.5))
+        rho_i_theta = np.sqrt(2 * m_ion * mean_T_J) / (e_charge * (B_T * (a / (R_major * params['q_safety_factor']))))
+        chi_base_profile = np.full_like(T_profile_J, nu_ii * (rho_i_theta**2) * (R_major/a)**1.5)
+    elif params.get('transport_model') == 'ITER98':
+        P_loss_est_MW = params.get('P_heating_MW_est', 50.0)
+        # Global scaling law for tau_E based on ITER98(y,2)
+        tau_E = 0.0562 * params['h_factor'] * (params['plasma_current_MA']**0.93) * (B_T**0.15) * (P_loss_est_MW**-0.69) * \
+                ((np.mean(n_profile)/1e19)**0.41) * ((m_ion/m_p)**0.19) * (R_major**1.97) * ((a/R_major)**0.58) * \
+                (params.get('kappa_elongation', 1.7)**0.78)
+        # Effective chi from global tau_E
+        chi_base_profile = np.full_like(T_profile_J, (a**2) / (6 * tau_E) if tau_E > 0 else float('inf'))
+    else: # Gyro-Bohm (Default)
+        rho_i_profile = np.sqrt(2 * m_ion * T_profile_J) / (e_charge * B_T)
+        # Avoid division by zero for rho_i at the center
+        rho_i_profile[rho_i_profile == 0] = 1e-9
+        chi_base_profile = (T_profile_J / (e_charge * B_T)) * (rho_i_profile / a) * params.get('transport_geometry_factor_G', 1.0)
 
-    # --- Stability and Engineering ---
-    plasma_beta_percent = calculate_plasma_beta(params)
-    wall_load_MW_m2 = (P_transport_MW + P_rad_MW) / A if A > 0 else float('inf') # Heat flux on PFCs
+    grad_T = np.gradient(T_profile_J, r_grid)
+    grad_T[-1] = grad_T[-2] # Avoid edge effects from gradient
+    q_profile = -n_profile * chi_base_profile * grad_T
+    
+    # Return heat flux at the second to last grid point (at r~a) multiplied by area
+    return (params['plasma_surface_area_m2'] * q_profile[-2]) / 1e6 if len(q_profile) > 1 else 0
 
+def calculate_stability_and_penalty(params, a, n_profile, T_profile_J):
+    """Calculates key stability metrics like Greenwald fraction and Beta limit."""
+    Ip_MA = params.get('plasma_current_MA', 0)
+    B_T = params['magnetic_field_T']
+    
+    n_avg_1e20 = np.mean(n_profile) / 1e20
+    n_greenwald_1e20 = Ip_MA / (np.pi * a**2) if a > 0 else float('inf')
+    density_ratio = n_avg_1e20 / n_greenwald_1e20 if n_greenwald_1e20 > 0 else float('inf')
+    
+    # Plasma beta = plasma pressure / magnetic pressure
+    plasma_pressure = np.mean(2 * n_profile * T_profile_J) # Factor of 2 for ions and electrons
+    magnetic_pressure = (B_T**2) / (2 * mu_0)
+    beta_percent = (plasma_pressure / magnetic_pressure) * 100 if magnetic_pressure > 0 else 0
+    
+    beta_N_troyon = 2.8 # Troyon limit coefficient for tokamaks
+    beta_troyon_percent = beta_N_troyon * (Ip_MA / (a * B_T)) if a > 0 and B_T > 0 else 0
+    
     return {
-        "P_fusion_MW": P_fusion_MW,
-        "P_rad_MW": P_rad_MW,
-        "P_transport_MW": P_transport_MW,
-        "P_heating_MW": P_heating_MW,
-        "Q_value": Q_value,
-        "confinement_time_s": confinement_time_s,
-        "Triple_Product_1e20": triple_product_1e20,
-        "plasma_beta_percent": plasma_beta_percent,
-        "wall_load_MW_m2": wall_load_MW_m2,
+        "greenwald_density_1e20": n_greenwald_1e20, "greenwald_fraction": density_ratio,
+        "troyon_beta_percent": beta_troyon_percent, "plasma_beta_percent": beta_percent
     }
 
-# ==============================================================================
-# SECTION 2: SIMPLIFIED PHYSICS FOR PARTICLE VISUALIZER
-# This section remains unchanged as it's for illustrative purposes.
-# ==============================================================================
-def lorentz_force_vis(t, y, B_scale):
-    pos, vel = y[:3], y[3:]
-    B = np.array([0, 0, B_scale])
-    acc = (e_charge / m_D) * np.cross(vel, B)
-    return np.concatenate((vel, acc))
-
-def simulate_particle_for_vis(params, coil_points):
-    pos0 = np.random.uniform(-0.04, 0.04, 3)
-    speed = params['max_velocity'] * np.random.rand()
-    direction = np.random.randn(3)
-    direction /= np.linalg.norm(direction)
-    y0 = np.concatenate((pos0, direction * speed))
-    t_span = (0, params['sim_time'])
-    t_eval = np.linspace(*t_span, 200)
-    sol = solve_ivp(lorentz_force_vis, t_span, y0, t_eval=t_eval, args=(params['B_strength'],), rtol=1e-5)
-    return sol
-
-def calculate_simple_q_value(trajectories):
-    initial_ke, final_ke = 0, 0
-    for sol in trajectories:
-        initial_ke += 0.5 * m_D * np.sum(sol.y[3:, 0]**2)
-        final_ke += 0.5 * m_D * np.sum(sol.y[3:, -1]**2)
-    return initial_ke, final_ke, final_ke / initial_ke if initial_ke > 0 else 0
-
-def plot_trajectories_for_vis(trajectories, coil_points, filename, info_text):
-    plt.close("all")
-    fig = plt.figure(num="Figure 1: Trajectories")
-    ax = fig.add_subplot(111, projection='3d')
-    for sol in trajectories: ax.plot(sol.y[0], sol.y[1], sol.y[2])
-    ax.set_title("Trajectories in Magnetic Field")
-    ax.set_xlabel("X"), ax.set_ylabel("Y"), ax.set_zlabel("Z")
-    fig.text(0.5, 0.05, info_text, ha='center', fontsize=10)
-    plt.savefig(filename); plt.show(block=False)
-
-def plot_energy_vs_time_for_vis(trajectories, filename):
-    plt.close("all")
-    fig = plt.figure(num="Figure 2: Energy")
-    ax = fig.add_subplot(111)
-    for i, sol in enumerate(trajectories):
-        energy = 0.5 * m_D * np.sum(sol.y[3:]**2, axis=0)
-        ax.plot(np.arange(len(sol.t)), energy, label=f"Particle {i}")
-    ax.set_title("Kinetic Energy vs Time")
-    ax.set_xlabel("Timestep"); ax.set_ylabel("Kinetic Energy (J)")
-    ax.legend(); plt.savefig(filename); plt.show(block=False)
-
-def animate_trajectories(trajectories, filename, root_window):
-    fig = plt.figure(figsize=(8, 6))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.set_title("Particle Trajectory Animation")
-    max_range = 0.2
-    ax.set_xlim([-max_range, max_range]), ax.set_ylim([-max_range, max_range]), ax.set_zlim([-max_range, max_range])
+def calculate_power_balance(params):
+    """Main function to calculate the power balance of the fusion plasma."""
+    r, a = get_radial_grid(params)
+    if a <= 0: return {}
+    R_major = params['plasma_volume_m3'] / (2 * np.pi**2 * a**2)
     
-    lines = [ax.plot([], [], [], lw=2)[0] for _ in trajectories]
-    predicted_lines = [ax.plot([], [], [], lw=1, ls='--', color='gray', alpha=0.7)[0] for _ in trajectories]
-
-    canvas = FigureCanvasTkAgg(fig, master=root_window)
-    canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=1)
-
-    def init():
-        for line, pred_line in zip(lines, predicted_lines):
-            line.set_data([], []); line.set_3d_properties([])
-            pred_line.set_data([], []); pred_line.set_3d_properties([])
-        return lines + predicted_lines
-
-    def update(frame):
-        for i, (sol, line, pred_line) in enumerate(zip(trajectories, lines, predicted_lines)):
-            if frame < sol.y.shape[1]:
-                line.set_data(sol.y[0, :frame+1], sol.y[1, :frame+1])
-                line.set_3d_properties(sol.y[2, :frame+1])
-                pred_line.set_data(sol.y[0, frame:], sol.y[1, frame:])
-                pred_line.set_3d_properties(sol.y[2, frame:])
-        return lines + predicted_lines
+    n_i_profile = create_radial_profile(r, a, params['ion_density_m3'], params['density_profile_alpha'])
+    T_i_profile_keV = create_radial_profile(r, a, params['ion_temperature_keV'], params['temp_profile_alpha'])
+    T_joules = T_i_profile_keV * 1000 * e_charge
     
-    num_frames = trajectories[0].y.shape[1]
-    ani = animation.FuncAnimation(fig, update, frames=num_frames, init_func=init, blit=False, interval=30)
+    # --- CORRECTED: The differential volume element dV must be used correctly inside the integral. ---
+    # dV = (2*pi*R) * (2*pi*r*dr) for a torus. We assume R is constant R_major.
+    # dV = 4 * pi^2 * R_major * r * dr. The term `4 * pi^2 * R_major * r` is the integrand multiplier.
+    dV_dr = 4 * np.pi**2 * R_major * r
+
+    # Fusion Power
+    reactivity = fusion_reactivity(T_i_profile_keV, params['fuel_cycle'])
+    E_fus_J, E_alpha_J, factor = (17.6e6*e_charge, 3.5e6*e_charge, 0.25) if params['fuel_cycle']=='D-T' else (3.6e6*e_charge, 1.0e6*e_charge, 0.5)
+    fusion_power_density = factor * (n_i_profile**2) * reactivity * E_fus_J
+    P_fusion_MW = np.trapz(fusion_power_density * dV_dr, r) / 1e6
+    P_alpha_MW = P_fusion_MW * (E_alpha_J / E_fus_J)
+
+    # Thermal Stored Energy
+    thermal_energy_density = 3 * n_i_profile * T_joules # W = 1.5*n_e*T_e + 1.5*n_i*T_i -> 3*n*T for n_e=n_i, T_e=T_i
+    W_th_joules = np.trapz(thermal_energy_density * dV_dr, r)
     
-    ani.save(filename, writer='pillow', fps=30)
-    canvas.draw()
+    stability = calculate_stability_and_penalty(params, a, n_i_profile, T_joules)
+
+    # Iterative loop for transport models that depend on power loss (like ITER98)
+    p_loss_est_MW = 50.0 # Initial guess
+    for _ in range(5): # Iterate a few times to converge
+        p_heat_flow_MW = max(1.0, P_alpha_MW + P_heating_MW if 'P_heating_MW' in locals() else p_loss_est_MW)
+        
+        # Estimate confinement time and Z_eff based on this power flow
+        tau_E_est = W_th_joules / (p_heat_flow_MW * 1e6) if p_heat_flow_MW > 0 else float('inf')
+        final_Z_eff = calculate_pmi_effects(params, n_i_profile, tau_E_est)
+        
+        # Radiation Loss (Bremsstrahlung)
+        rad_power_density = 1.69e-38 * (n_i_profile**2) * final_Z_eff * np.sqrt(T_i_profile_keV) # Z_eff^2*sqrt(T) form, more accurate
+        P_rad_MW = np.trapz(rad_power_density * dV_dr, r) / 1e6
+        
+        # Transport Loss
+        params['P_heating_MW_est'] = p_heat_flow_MW
+        P_transport_MW = calculate_transport_loss(params, n_i_profile, T_i_profile_keV, r, a, R_major)
+        
+        p_loss_new_MW = P_rad_MW + P_transport_MW
+        if abs(p_loss_est_MW - p_loss_new_MW) < 0.1: break # Converged
+        p_loss_est_MW = 0.5 * p_loss_est_MW + 0.5 * p_loss_new_MW # Dampen oscillation
+    else: # If loop finishes without break
+        p_loss_est_MW = p_loss_new_MW
+
+    P_loss_MW = p_loss_est_MW
+    P_heating_MW = max(0, P_loss_MW - P_alpha_MW)
+    Q_value = P_fusion_MW / P_heating_MW if P_heating_MW > 1e-9 else float('inf')
+    confinement_time_s = W_th_joules / (P_loss_MW * 1e6) if P_loss_MW > 0 else float('inf')
+    
+    return {
+        "P_fusion_MW": P_fusion_MW, "P_alpha_MW": P_alpha_MW, "P_rad_MW": P_rad_MW,
+        "P_transport_MW": P_transport_MW, "P_heating_MW": P_heating_MW, "Q_value": Q_value,
+        "confinement_time_s": confinement_time_s, "final_Z_eff": final_Z_eff,
+        "avg_wall_load_MW_m2": (P_rad_MW * 0.8) / params['plasma_surface_area_m2'] if params['plasma_surface_area_m2'] > 0 else 0,
+        "peak_divertor_load_MW_m2": (P_transport_MW + P_rad_MW * 0.2) / params['divertor_wetted_area_m2'] if params['divertor_wetted_area_m2'] > 0 else 0,
+        **stability
+    }
